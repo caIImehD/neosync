@@ -90,12 +90,22 @@ app.post('/bot-register', requireSecret, async (req, res) => {
   try {
     await db.collection('bot_users').doc(discord_id).set({
       discord_id,
-      username:         username        || '',
-      avatar_url:       avatar_url      || '',
-      profile_color:    profile_color   || '',
+      username:         username         || '',
+      avatar_url:       avatar_url       || '',
+      profile_color:    profile_color    || '',
       profile_subcolor: profile_subcolor || '',
       synced_at: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
+
+    // if already linked to a site account, sync colors there too
+    const linked = await db.collection('users').where('discord_id', '==', discord_id).get();
+    if (!linked.empty) {
+      await linked.docs[0].ref.update({
+        ...(profile_color    ? { profile_color_primary:   profile_color }    : {}),
+        ...(profile_subcolor ? { profile_color_secondary: profile_subcolor } : {})
+      });
+    }
+
     res.json({ success: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
