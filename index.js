@@ -44,30 +44,59 @@ app.post('/discord/exchange', async (req, res) => {
     const tokenData = await tokenRes.json();
     if (!tokenData.access_token) return res.status(400).json({ error: 'OAuth failed', detail: tokenData });
 
-    // get discord user
-    const userRes  = await fetch('https://discord.com/api/users/@me', {
+    const userRes     = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: 'Bearer ' + tokenData.access_token }
     });
     const discordUser = await userRes.json();
     if (!discordUser.id) return res.status(400).json({ error: 'Could not fetch discord user' });
 
     // check not already linked to another account
-    const existing = await db.collection('users')
-      .where('discord_id', '==', discordUser.id).get();
+    const existing = await db.collection('users').where('discord_id', '==', discordUser.id).get();
     if (!existing.empty && existing.docs[0].id !== uid)
       return res.status(409).json({ error: 'discord_already_linked' });
 
-    // update firebase user
+    // pull bot profile data if it exists
+    const botUser = await db.collection('bot_users').doc(discordUser.id).get();
+    const botData = botUser.exists ? botUser.data() : {};
+
+    // update firebase user with discord + bot profile data
     await db.collection('users').doc(uid).update({
       discord_id:    discordUser.id,
       discord_tag:   discordUser.username,
       avatar_url:    discordUser.avatar
         ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
-        : '',
+        : (botData.avatar_url || ''),
+      // import bot profile colors if they exist
+      ...(botData.profile_color    ? { profile_color_primary:   botData.profile_color }    : {}),
+      ...(botData.profile_subcolor ? { profile_color_secondary: botData.profile_subcolor } : {}),
       discord_linked_at: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    res.json({ success: true, discord_id: discordUser.id, username: discordUser.username });
+    res.json({
+      success:    true,
+      discord_id: discordUser.id,
+      username:   discordUser.username,
+      imported_bot_colors: !!botData.profile_color
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── BOT REGISTER (called by BotGhost on user registration) ──
+app.post('/bot-register', requireSecret, async (req, res) => {
+  const { discord_id, username, avatar_url, profile_color, profile_subcolor } = req.body;
+  if (!discord_id) return res.status(400).json({ error: 'Missing discord_id' });
+  try {
+    await db.collection('bot_users').doc(discord_id).set({
+      discord_id,
+      username:         username        || '',
+      avatar_url:       avatar_url      || '',
+      profile_color:    profile_color   || '',
+      profile_subcolor: profile_subcolor || '',
+      synced_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    res.json({ success: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -76,27 +105,36 @@ app.post('/discord/exchange', async (req, res) => {
 // ── DISCORD DM VERIFICATION ──
 app.post('/discord/send-verify', requireSecret, async (req, res) => {
   const { discord_id, code, site_url } = req.body;
+  if (!discord_id || !code) return res.status(400).json({ error: 'Missing discord_id or code' });
   try {
+    // check if user is registered with bot
+    const botUser = await db.collection('bot_users').doc(discord_id).get();
+    if (!botUser.exists)
+      return res.status(404).json({ error: 'not_in_bot_database' });
+
+    // store pending code
+    await db.collection('bot_users').doc(discord_id).update({
+      pending_code:    code,
+      pending_code_at: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    const verifyUrl = site_url + '?verify=' + code;
+
     // open DM channel
     const dmRes = await fetch('https://discord.com/api/v10/users/@me/channels', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bot ' + process.env.DISCORD_BOT_TOKEN
-      },
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bot ' + process.env.DISCORD_BOT_TOKEN },
       body: JSON.stringify({ recipient_id: discord_id })
     });
     const dm = await dmRes.json();
+    if (!dm.id) return res.status(500).json({ error: 'Could not open DM channel' });
 
     // send verification message
     await fetch(`https://discord.com/api/v10/channels/${dm.id}/messages`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bot ' + process.env.DISCORD_BOT_TOKEN
-      },
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bot ' + process.env.DISCORD_BOT_TOKEN },
       body: JSON.stringify({
-        content: `**nullscapes Game Corner** — Account Verification\n\nClick to verify: ${site_url}?verify=${code}\n\nOr enter this code on the site: \`${code}\`\n\n*This code expires in 10 minutes.*`
+        content: `**nullscapes Game Corner** — Account Verification\n\n🔗 Click to verify: ${verifyUrl}\n\nOr enter this code on the site: \`${code}\`\n\n*This code expires in 10 minutes.*`
       })
     });
 
@@ -106,18 +144,69 @@ app.post('/discord/send-verify', requireSecret, async (req, res) => {
   }
 });
 
-// ── BOT SYNC (from neoEngine) ──
+// ── VERIFY CODE (site submits code, neo-sync validates + links) ──
+app.post('/discord/verify-code', requireSecret, async (req, res) => {
+  const { discord_id, code, uid } = req.body;
+  if (!discord_id || !code || !uid) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const botUser = await db.collection('bot_users').doc(discord_id).get();
+    if (!botUser.exists) return res.status(404).json({ error: 'not_in_bot_database' });
+
+    const data = botUser.data();
+
+    // check code matches
+    if (data.pending_code !== code)
+      return res.status(400).json({ error: 'wrong_code' });
+
+    // check code not expired (10 min)
+    const codeAge = Date.now() - (data.pending_code_at?.toMillis?.() || 0);
+    if (codeAge > 10 * 60 * 1000)
+      return res.status(400).json({ error: 'code_expired' });
+
+    // link discord to firebase user + import bot profile
+    await db.collection('users').doc(uid).update({
+      discord_id:    discord_id,
+      discord_tag:   data.username || '',
+      avatar_url:    data.avatar_url || '',
+      ...(data.profile_color    ? { profile_color_primary:   data.profile_color }    : {}),
+      ...(data.profile_subcolor ? { profile_color_secondary: data.profile_subcolor } : {}),
+      discord_linked_at: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // clear pending code
+    await db.collection('bot_users').doc(discord_id).update({
+      pending_code: admin.firestore.FieldValue.delete(),
+      linked_uid:   uid
+    });
+
+    res.json({ success: true, username: data.username });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── BOT → SITE UPDATES ──
+app.post('/bot-update', requireSecret, async (req, res) => {
+  const { uid, updates } = req.body;
+  if (!uid || !updates) return res.status(400).json({ error: 'Missing uid or updates' });
+  try {
+    const allowed = ['luck', 'garnet', 'glimmose', 'discord_id', 'birthday', 'best_friends'];
+    const safe = {};
+    for (const k of allowed) { if (updates[k] !== undefined) safe[k] = updates[k]; }
+    await db.collection('users').doc(uid).update(safe);
+    res.json({ success: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── NEO-SYNC (from neoEngine) ──
 app.post('/neo-sync', requireSecret, async (req, res) => {
   const { event, uid, ...data } = req.body;
   try {
     switch(event) {
-      case 'achievement':
-        // notify bot of achievement
-        break;
       case 'purchase':
-        await db.collection('users').doc(uid).update({
-          [`purchases.${data.item}`]: true
-        });
+        await db.collection('users').doc(uid).update({ [`purchases.${data.item}`]: true });
         break;
       case 'ban':
         await db.collection('users').doc(uid).update({ is_banned: true, ban_reason: data.reason });
@@ -125,26 +214,7 @@ app.post('/neo-sync', requireSecret, async (req, res) => {
       case 'vip_grant':
         await db.collection('users').doc(uid).update({ vip_tier: data.tier });
         break;
-      case 'daily_claim':
-        // log it
-        break;
     }
-    res.json({ success: true });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── BOT → SITE (from neoGenesis bot) ──
-app.post('/bot-update', requireSecret, async (req, res) => {
-  const { uid, updates } = req.body;
-  if (!uid || !updates) return res.status(400).json({ error: 'Missing uid or updates' });
-  try {
-    // whitelist what the bot can update
-    const allowed = ['luck', 'garnet', 'glimmose', 'discord_id', 'birthday', 'best_friends'];
-    const safe = {};
-    for (const k of allowed) { if (updates[k] !== undefined) safe[k] = updates[k]; }
-    await db.collection('users').doc(uid).update(safe);
     res.json({ success: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
