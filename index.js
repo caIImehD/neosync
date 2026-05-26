@@ -46,6 +46,7 @@ app.post('/discord/exchange', async (req, res) => {
 
     const userRes     = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: 'Bearer ' + tokenData.access_token }
+      console.log('discord token response:', JSON.stringify(tokenData));
     });
     const discordUser = await userRes.json();
     if (!discordUser.id) return res.status(400).json({ error: 'Could not fetch discord user' });
