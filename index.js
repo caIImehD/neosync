@@ -42,11 +42,11 @@ app.post('/discord/exchange', async (req, res) => {
       body: params
     });
     const tokenData = await tokenRes.json();
+    console.log('discord token response:', JSON.stringify(tokenData));
     if (!tokenData.access_token) return res.status(400).json({ error: 'OAuth failed', detail: tokenData });
 
-    const userRes     = await fetch('https://discord.com/api/users/@me', {
+    const userRes = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: 'Bearer ' + tokenData.access_token }
-      console.log('discord token response:', JSON.stringify(tokenData));
     });
     const discordUser = await userRes.json();
     if (!discordUser.id) return res.status(400).json({ error: 'Could not fetch discord user' });
@@ -67,7 +67,6 @@ app.post('/discord/exchange', async (req, res) => {
       avatar_url:    discordUser.avatar
         ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
         : (botData.avatar_url || ''),
-      // import bot profile colors if they exist
       ...(botData.profile_color    ? { profile_color_primary:   botData.profile_color }    : {}),
       ...(botData.profile_subcolor ? { profile_color_secondary: botData.profile_subcolor } : {}),
       discord_linked_at: admin.firestore.FieldValue.serverTimestamp()
